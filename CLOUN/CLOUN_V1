@@ -1,0 +1,770 @@
+/*
+ * CLOUN_V1 - Ball Game Firmware
+ * Board  : Custom ESP32 (Arduino IDE -> "ESP32 Dev Module")
+ *
+ * Door mechanism: door relay runs a one-direction door motor (crank/cam).
+ *   LIMIT UP   active = door CLOSED
+ *   LIMIT DOWN active = door OPEN
+ *
+ * Boot: if door is not closed, door motor runs until LIMIT UP (10 s max -> E01).
+ *
+ * Game flow:
+ *   START pressed
+ *     Every START press resets all scores to 000 immediately.
+ *     If door is not closed (LIMIT UP not active): run door motor until
+ *     LIMIT UP is active. Not closed within 10 s -> E01.
+ *     t = 0      : Door motor ON until LIMIT DOWN (door open), sensors armed
+ *     t = 0-200ms: sensor pulses ignored
+ *     t = 500ms  : Ball motor relay ON
+ *     door open + 5 s : Door motor ON until LIMIT UP (door closed). Timeout -> E02
+ *     t = 60s    : Motor OFF, sensors disarmed, final score blinks
+ *   Every ball pulse on any of the 6 sensors = +1 score (200 ms debounce per sensor)
+ *
+ * ---------------------------------------------------------------------------
+ * PIN MAP
+ * ---------------------------------------------------------------------------
+ *   Sensor 1..6   : 27, 14, 26, 23, 35, 13   (35 needs external 10k pull-up)
+ *   Door relay    : 4
+ *   Motor relay   : 25
+ *   SW1 START     : 36   (input-only, external 10k pull-up)
+ *   SW2 LIMIT UP  : 39   (input-only, external 10k pull-up)  -> door CLOSED
+ *   SW3 LIMIT DOWN: 34   (input-only, external 10k pull-up)  -> door OPEN
+ *
+ *   74HC595 x3 (3-digit common-anode display)
+ *     DATA  (SER,   pin 14) : GPIO 18
+ *     CLOCK (SRCLK, pin 11) : GPIO 21
+ *     LATCH (RCLK,  pin 12) : GPIO 22
+ *     OE    (pin 13)        : GND
+ *     MR    (pin 10)        : VCC
+ *     Chain: GPIO18 -> SER #1, Q7'(pin 9) #1 -> SER #2, Q7' #2 -> SER #3
+ *            CLOCK and LATCH shared by all three
+ *     #1 = hundreds (left), #2 = tens, #3 = units (right)
+ *     Q0..Q7 = a, b, c, d, e, f, g, dp
+ *
+ *   Addressable LED strip (WS2812B, 6 LEDs): DATA -> GPIO 16 (use ~330R series)
+ *     LED n sits next to Sensor n (LED 1 = Sensor 1 ... LED 6 = Sensor 6)
+ *
+ *   Reserved (NOT used): 32, 33, 19, 12, 2, 5, 17
+ * ---------------------------------------------------------------------------
+ *
+ * Library: "Adafruit NeoPixel" (Arduino IDE -> Tools -> Manage Libraries)
+ *
+ * LED patterns:
+ *   IDLE        : playlist of 9 animations, 8 s each, fading between them:
+ *                 rainbow, breathing, comet, scanner, twinkle, theatre chase,
+ *                 colour wipe, fire, police flash   (brightness LED_BRIGHTNESS_IDLE)
+ *   GAME / END  : brightness LED_BRIGHTNESS_GAME (180)
+ *   GAME START  : green chase while the door is open (first 5 s)
+ *   RUNNING     : background colour fades green -> yellow -> red as time runs out
+ *                 last 10 s: background pulses red
+ *   BALL SCORED : LED of that sensor flashes white, whole strip blinks gold
+ *   GAME END    : rainbow sparkle celebration, then back to IDLE
+ *   DOOR HOMING : all LEDs blink orange (closing door before game starts)
+ *   ERROR       : all LEDs blink red (E01 / E02)
+ */
+
+#include <Adafruit_NeoPixel.h>
+
+// Types used as function parameters must be declared before any function,
+// because the Arduino IDE auto-generates prototypes near the top of the sketch.
+enum LedMode { LED_IDLE, LED_HOMING, LED_GAME, LED_END, LED_ERROR };
+enum DoorPhase { DOOR_OPENING, DOOR_HOLD, DOOR_CLOSING, DOOR_DONE };   // door cycle during a game
+
+// ============================ CONFIGURATION ================================
+
+// Pins
+const uint8_t SENSOR_PINS[6]   = {27, 14, 26, 23, 35, 13};
+const uint8_t PIN_DOOR_RELAY   = 4;
+const uint8_t PIN_MOTOR_RELAY  = 25;
+const uint8_t PIN_SW_START     = 36;
+const uint8_t PIN_SW_LIMIT_UP  = 39;
+const uint8_t PIN_SW_LIMIT_DN  = 34;
+const uint8_t PIN_595_DATA     = 18;
+const uint8_t PIN_595_CLOCK    = 21;
+const uint8_t PIN_595_LATCH    = 22;
+const uint8_t PIN_LED_STRIP    = 16;
+const uint8_t LED_COUNT        = 6;
+const uint8_t LED_BRIGHTNESS_IDLE = 120;   // 0-255, idle / door / error
+const uint8_t LED_BRIGHTNESS_GAME = 180;   // 0-255, during game and end celebration
+
+// Signal levels (flip here if your hardware is opposite)
+const uint8_t SENSOR_ACTIVE_LEVEL = LOW;   // sensors pulled up, go LOW (0) when a ball passes
+const uint8_t RELAY_ON_LEVEL      = HIGH;  // relay driver turns ON with HIGH
+const uint8_t SWITCH_ACTIVE_LEVEL = LOW;   // switch pulls LOW when pressed
+const bool    DISPLAY_COMMON_ANODE = true;
+const bool    DIGIT_ORDER_REVERSED = false; // set true if digits appear right-to-left
+
+// Timing (ms)
+const uint32_t GAME_TIME_MS          = 60000;
+const uint32_t MOTOR_DELAY_MS        = 500;
+const uint32_t DOOR_OPEN_MS          = 2000;   // door stays open this long
+const uint32_t SENSOR_DEBOUNCE_MS    = 200;    // per sensor: one ball per 200 ms
+const uint32_t SENSOR_IGNORE_START_MS = 200;   // no scoring for first 200 ms after game start
+const uint32_t DOOR_MOVE_TIMEOUT_MS  = 5000;   // max time to reach a limit when opening/closing
+const uint32_t DOOR_HOME_TIMEOUT_MS  = 10000;  // max time to close the door before a game
+const uint32_t SWITCH_DEBOUNCE_MS    = 30;
+const uint32_t ERROR_SHOW_MS         = 2000;
+const uint32_t BLINK_INTERVAL_MS     = 300;
+const uint8_t  BLINK_COUNT           = 3;
+
+const uint32_t LED_FRAME_MS          = 20;     // ~50 fps
+const uint32_t LED_HIT_FLASH_MS      = 250;
+const uint32_t LED_FINAL_WARNING_MS  = 10000;  // last 10 s pulse red
+const uint32_t LED_END_SHOW_MS       = 4000;   // celebration length
+const uint32_t IDLE_ANIM_MS          = 8000;   // each idle animation plays this long
+const uint32_t IDLE_FADE_MS          = 400;    // fade in/out between idle animations
+
+const uint16_t MAX_SCORE = 999;
+
+// ============================ DISPLAY ======================================
+
+// Segment patterns, bit0 = a ... bit6 = g, bit7 = dp (common-cathode logic)
+const uint8_t DIGIT_SEG[10] = {
+  0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F
+};
+const uint8_t SEG_E     = 0x79;
+const uint8_t SEG_BLANK = 0x00;
+uint8_t shownSeg[3] = {0xAA, 0xAA, 0xAA};   // force first write
+
+void writeDisplay(uint8_t left, uint8_t mid, uint8_t right) {
+  if (left == shownSeg[0] && mid == shownSeg[1] && right == shownSeg[2]) return;
+  shownSeg[0] = left; shownSeg[1] = mid; shownSeg[2] = right;
+
+  uint8_t seg[3] = {left, mid, right};
+  if (DIGIT_ORDER_REVERSED) { uint8_t t = seg[0]; seg[0] = seg[2]; seg[2] = t; }
+
+  digitalWrite(PIN_595_LATCH, LOW);
+  // First byte shifted ends up in the last 595 (#3 = units)
+  for (int8_t i = 2; i >= 0; i--) {
+    uint8_t out = DISPLAY_COMMON_ANODE ? (uint8_t)~seg[i] : seg[i];
+    shiftOut(PIN_595_DATA, PIN_595_CLOCK, MSBFIRST, out);
+  }
+  digitalWrite(PIN_595_LATCH, HIGH);
+}
+
+void showNumber(uint16_t n) {
+  if (n > MAX_SCORE) n = MAX_SCORE;
+  writeDisplay(DIGIT_SEG[(n / 100) % 10], DIGIT_SEG[(n / 10) % 10], DIGIT_SEG[n % 10]);
+}
+
+void showError(uint8_t code) {
+  writeDisplay(SEG_E, DIGIT_SEG[(code / 10) % 10], DIGIT_SEG[code % 10]);
+}
+
+void showBlank() {
+  writeDisplay(SEG_BLANK, SEG_BLANK, SEG_BLANK);
+}
+// ============================ RELAYS =======================================
+
+void setRelay(uint8_t pin, bool on) {
+  digitalWrite(pin, on ? RELAY_ON_LEVEL : !RELAY_ON_LEVEL);
+}
+
+// ============================ SENSORS (ISR) ================================
+
+volatile uint16_t score = 0;
+volatile uint32_t sensorHits[6] = {0};
+volatile uint8_t  sensorEventMask = 0;   // bit n = sensor n scored since last read
+volatile int64_t  lastPulseUs[6] = {0};
+volatile int64_t  sensorsLiveAtUs = 0;     // pulses before this time are ignored
+portMUX_TYPE scoreMux = portMUX_INITIALIZER_UNLOCKED;
+
+void IRAM_ATTR sensorISR(void *arg) {
+  uint8_t idx = (uint8_t)(uintptr_t)arg;
+  int64_t now = esp_timer_get_time();
+
+  // Noise filter: pin must still be at the active level (rejects spikes and
+  // the ESP32's occasional false trigger on the wrong edge)
+  if (digitalRead(SENSOR_PINS[idx]) != SENSOR_ACTIVE_LEVEL) return;
+
+  portENTER_CRITICAL_ISR(&scoreMux);
+  if (now >= sensorsLiveAtUs &&
+      now - lastPulseUs[idx] >= (int64_t)SENSOR_DEBOUNCE_MS * 1000) {
+    lastPulseUs[idx] = now;
+    if (score < MAX_SCORE) score++;
+    sensorHits[idx]++;
+    sensorEventMask |= (1 << idx);
+  }
+  portEXIT_CRITICAL_ISR(&scoreMux);
+}
+
+void armSensors() {
+  int64_t now = esp_timer_get_time();
+  portENTER_CRITICAL(&scoreMux);
+  score = 0;
+  sensorEventMask = 0;
+  for (uint8_t i = 0; i < 6; i++) {
+    sensorHits[i] = 0;
+    lastPulseUs[i] = now - (int64_t)SENSOR_DEBOUNCE_MS * 1000;
+  }
+  sensorsLiveAtUs = now + (int64_t)SENSOR_IGNORE_START_MS * 1000;
+  portEXIT_CRITICAL(&scoreMux);
+
+  int edge = (SENSOR_ACTIVE_LEVEL == LOW) ? FALLING : RISING;
+  for (uint8_t i = 0; i < 6; i++) {
+    attachInterruptArg(digitalPinToInterrupt(SENSOR_PINS[i]), sensorISR,
+                       (void *)(uintptr_t)i, edge);
+  }
+}
+
+void disarmSensors() {
+  for (uint8_t i = 0; i < 6; i++) {
+    detachInterrupt(digitalPinToInterrupt(SENSOR_PINS[i]));
+  }
+}
+
+uint16_t readScore() {
+  portENTER_CRITICAL(&scoreMux);
+  uint16_t s = score;
+  portEXIT_CRITICAL(&scoreMux);
+  return s;
+}
+
+uint8_t takeSensorEvents() {
+  portENTER_CRITICAL(&scoreMux);
+  uint8_t m = sensorEventMask;
+  sensorEventMask = 0;
+  portEXIT_CRITICAL(&scoreMux);
+  return m;
+}
+
+// ============================ LED STRIP ====================================
+
+Adafruit_NeoPixel strip(LED_COUNT, PIN_LED_STRIP, NEO_RGB + NEO_KHZ800);
+
+LedMode  ledMode      = LED_IDLE;
+uint32_t ledModeStart  = 0;
+uint32_t ledLastFrame  = 0;
+uint32_t ledHitAt[LED_COUNT] = {0};
+bool     ledHitActive[LED_COUNT] = {false};
+uint32_t ledLastHitAt  = 0;
+bool     ledAnyHit     = false;
+bool     ledDoorOpen   = false;   // set by game logic while the door cycle is running
+
+// Idle animation playlist state
+const uint8_t IDLE_ANIM_COUNT = 9;
+uint8_t  idleAnim      = 0;
+uint32_t idleAnimStart = 0;
+uint8_t  twLvl[LED_COUNT]  = {0};    // twinkle brightness per LED
+uint16_t twHue[LED_COUNT]  = {0};    // twinkle hue per LED
+uint32_t fireBuf[LED_COUNT] = {0};   // fire flicker colours
+uint32_t fireLastAt    = 0;
+
+void ledSetMode(LedMode m, uint32_t now) {
+  if (m == ledMode) return;
+  ledMode = m;
+  ledModeStart = now;
+  strip.setBrightness((m == LED_GAME || m == LED_END) ? LED_BRIGHTNESS_GAME : LED_BRIGHTNESS_IDLE);
+  if (m == LED_IDLE) idleAnimStart = now;   // restart current animation with a fade-in
+  ledAnyHit = false;
+  for (uint8_t i = 0; i < LED_COUNT; i++) ledHitActive[i] = false;
+}
+
+void ledSensorHit(uint8_t idx, uint32_t now) {
+  if (idx < LED_COUNT) { ledHitAt[idx] = now; ledHitActive[idx] = true; }
+  ledLastHitAt = now;
+  ledAnyHit = true;
+}
+
+// 0..255 triangle wave with given period
+uint8_t ledWave(uint32_t t, uint32_t period) {
+  uint32_t p = t % period;
+  uint32_t half = period / 2;
+  return (p < half) ? (p * 255 / half) : ((period - p) * 255 / half);
+}
+
+uint32_t ledScale(uint32_t c, uint8_t level) {
+  uint8_t r = (uint8_t)(c >> 16), g = (uint8_t)(c >> 8), b = (uint8_t)c;
+  return strip.Color(r * level / 255, g * level / 255, b * level / 255);
+}
+
+uint32_t ledHsv(uint16_t hue, uint8_t sat, uint8_t val) {
+  return strip.gamma32(strip.ColorHSV(hue, sat, val));
+}
+
+// Idle playlist: each animation runs IDLE_ANIM_MS, then fades to the next one
+void ledFrameIdle(uint32_t now) {
+  if (now - idleAnimStart >= IDLE_ANIM_MS) {
+    idleAnim = (idleAnim + 1) % IDLE_ANIM_COUNT;
+    idleAnimStart = now;
+    for (uint8_t i = 0; i < LED_COUNT; i++) twLvl[i] = 0;
+  }
+  uint32_t t = now - idleAnimStart;
+  const uint8_t N = LED_COUNT;
+  uint32_t buf[LED_COUNT];
+
+  switch (idleAnim) {
+    case 0: {   // Rainbow wheel
+      for (uint8_t i = 0; i < N; i++) buf[i] = ledHsv(t * 8 + i * (65536 / N), 255, 255);
+      break;
+    }
+    case 1: {   // Breathing, colour slowly shifting
+      uint8_t v = 15 + ledWave(t, 3000) * 240 / 255;
+      for (uint8_t i = 0; i < N; i++) buf[i] = ledHsv(t * 3, 255, v);
+      break;
+    }
+    case 2: {   // Comet chase, new colour each lap
+      uint32_t step = t / 90;
+      uint8_t  head = step % N;
+      uint16_t hue  = (step / N) * 9000;
+      for (uint8_t i = 0; i < N; i++) {
+        uint8_t d = (head + N - i) % N;
+        buf[i] = ledHsv(hue, 255, d == 0 ? 255 : d == 1 ? 110 : d == 2 ? 40 : 0);
+      }
+      break;
+    }
+    case 3: {   // Scanner bouncing end to end (red)
+      uint8_t period = (N - 1) * 2;
+      uint8_t s = (t / 110) % period;
+      uint8_t pos = (s < N) ? s : period - s;
+      for (uint8_t i = 0; i < N; i++) {
+        uint8_t d = (i > pos) ? i - pos : pos - i;
+        buf[i] = strip.Color(d == 0 ? 255 : d == 1 ? 50 : 0, 0, 0);
+      }
+      break;
+    }
+    case 4: {   // Random colour twinkle
+      for (uint8_t i = 0; i < N; i++) {
+        twLvl[i] = (twLvl[i] > 6) ? twLvl[i] - 6 : 0;
+        if (twLvl[i] == 0 && random(100) < 4) { twLvl[i] = 255; twHue[i] = random(65536); }
+        buf[i] = ledHsv(twHue[i], 220, twLvl[i]);
+      }
+      break;
+    }
+    case 5: {   // Theatre chase, every third LED
+      uint8_t phase = (t / 150) % 3;
+      for (uint8_t i = 0; i < N; i++) buf[i] = (i % 3 == phase) ? ledHsv(t * 10, 255, 255) : 0;
+      break;
+    }
+    case 6: {   // Colour wipe: fill one by one with a new colour
+      uint32_t step = t / 220;
+      uint8_t  fill = step % N;
+      uint32_t lap  = step / N;
+      uint32_t cNew = ledHsv(lap * 13000, 255, 255);
+      uint32_t cOld = lap ? ledHsv((lap - 1) * 13000, 255, 255) : 0;
+      for (uint8_t i = 0; i < N; i++) buf[i] = (i <= fill) ? cNew : cOld;
+      break;
+    }
+    case 7: {   // Fire flicker
+      if (now - fireLastAt >= 70) {
+        fireLastAt = now;
+        for (uint8_t i = 0; i < N; i++) {
+          uint8_t lvl = random(120, 256);
+          fireBuf[i] = strip.Color(lvl, lvl * random(15, 45) / 100, 0);
+        }
+      }
+      for (uint8_t i = 0; i < N; i++) buf[i] = fireBuf[i];
+      break;
+    }
+    default: {  // Police: red half / blue half double flash
+      uint8_t p = (t / 90) % 10;
+      bool redOn  = (p == 0 || p == 2);
+      bool blueOn = (p == 5 || p == 7);
+      for (uint8_t i = 0; i < N; i++) {
+        if (i < N / 2) buf[i] = redOn  ? strip.Color(255, 0, 0) : 0;
+        else           buf[i] = blueOn ? strip.Color(0, 0, 255) : 0;
+      }
+      break;
+    }
+  }
+
+  // Fade in at the start and out at the end of each animation
+  uint32_t edge = min(t, IDLE_ANIM_MS - t);
+  uint8_t fade = (edge >= IDLE_FADE_MS) ? 255 : edge * 255 / IDLE_FADE_MS;
+  for (uint8_t i = 0; i < N; i++) strip.setPixelColor(i, ledScale(buf[i], fade));
+}
+
+void ledFrameGame(uint32_t now) {
+  uint32_t t = now - ledModeStart;
+
+  if (ledDoorOpen) {
+    // Door opening / open / closing: green chase
+    uint8_t head = (t / 80) % LED_COUNT;
+    for (uint8_t i = 0; i < LED_COUNT; i++) {
+      uint8_t dist = (head + LED_COUNT - i) % LED_COUNT;
+      uint8_t lvl = dist == 0 ? 255 : dist == 1 ? 90 : dist == 2 ? 25 : 0;
+      strip.setPixelColor(i, strip.Color(0, lvl, 0));
+    }
+  } else {
+    // Background hue follows remaining time: green (start) -> red (end)
+    uint32_t left = (t < GAME_TIME_MS) ? GAME_TIME_MS - t : 0;
+    uint16_t hue = (uint32_t)21845 * left / GAME_TIME_MS;   // 21845 = green, 0 = red
+    uint8_t lvl = 70;
+    if (left <= LED_FINAL_WARNING_MS) { hue = 0; lvl = 30 + ledWave(t, 500) * 225 / 255; }
+    uint32_t bg = strip.gamma32(strip.ColorHSV(hue, 255, lvl));
+    for (uint8_t i = 0; i < LED_COUNT; i++) strip.setPixelColor(i, bg);
+  }
+
+  // Whole strip gold blink on any score
+  if (ledAnyHit && now - ledLastHitAt < LED_HIT_FLASH_MS / 2) {
+    for (uint8_t i = 0; i < LED_COUNT; i++) strip.setPixelColor(i, strip.Color(255, 140, 0));
+  }
+
+  // Scoring sensor's own LED flashes white and fades out
+  for (uint8_t i = 0; i < LED_COUNT; i++) {
+    if (!ledHitActive[i]) continue;
+    uint32_t dt = now - ledHitAt[i];
+    if (dt >= LED_HIT_FLASH_MS) { ledHitActive[i] = false; continue; }
+    uint8_t lvl = 255 - dt * 255 / LED_HIT_FLASH_MS;
+    strip.setPixelColor(i, strip.Color(lvl, lvl, lvl));
+  }
+}
+
+void ledFrameEnd(uint32_t now) {
+  uint32_t t = now - ledModeStart;
+  if (t >= LED_END_SHOW_MS) { ledSetMode(LED_IDLE, now); ledFrameIdle(now); return; }
+
+  // Fast rainbow with random white sparkles, fading out at the end
+  uint8_t fade = (t > LED_END_SHOW_MS - 1000) ? (LED_END_SHOW_MS - t) * 255 / 1000 : 255;
+  uint16_t base = (uint16_t)(t * 60);
+  for (uint8_t i = 0; i < LED_COUNT; i++) {
+    uint32_t c = strip.gamma32(strip.ColorHSV(base + i * (65536 / LED_COUNT)));
+    if (random(100) < 12) c = strip.Color(255, 255, 255);
+    strip.setPixelColor(i, ledScale(c, fade));
+  }
+}
+
+void ledFrameHoming(uint32_t now) {
+  bool on = ((now - ledModeStart) / 400) % 2 == 0;
+  for (uint8_t i = 0; i < LED_COUNT; i++) {
+    strip.setPixelColor(i, on ? strip.Color(255, 90, 0) : 0);
+  }
+}
+
+void ledFrameError(uint32_t now) {
+  bool on = ((now - ledModeStart) / 250) % 2 == 0;
+  for (uint8_t i = 0; i < LED_COUNT; i++) {
+    strip.setPixelColor(i, on ? strip.Color(255, 0, 0) : 0);
+  }
+}
+
+void ledUpdate(uint32_t now) {
+  if (now - ledLastFrame < LED_FRAME_MS) return;
+  ledLastFrame = now;
+
+  switch (ledMode) {
+    case LED_IDLE:  ledFrameIdle(now);  break;
+    case LED_HOMING: ledFrameHoming(now); break;
+    case LED_GAME:  ledFrameGame(now);  break;
+    case LED_END:   ledFrameEnd(now);   break;
+    case LED_ERROR: ledFrameError(now); break;
+  }
+  strip.show();
+}
+
+// ============================ SWITCHES =====================================
+
+struct DebouncedSwitch {
+  uint8_t  pin;
+  bool     stable;      // true = active
+  bool     lastRaw;
+  uint32_t changedAt;
+  bool     pressedEvent;
+
+  void begin(uint8_t p) {
+    pin = p;
+    lastRaw = stable = (digitalRead(pin) == SWITCH_ACTIVE_LEVEL);
+    changedAt = millis();
+    pressedEvent = false;
+  }
+
+  void update(uint32_t now) {
+    bool raw = (digitalRead(pin) == SWITCH_ACTIVE_LEVEL);
+    if (raw != lastRaw) { lastRaw = raw; changedAt = now; }
+    if (raw != stable && (now - changedAt) >= SWITCH_DEBOUNCE_MS) {
+      stable = raw;
+      if (stable) pressedEvent = true;
+    }
+  }
+
+  bool pressed() { bool e = pressedEvent; pressedEvent = false; return e; }
+  bool active() const { return stable; }
+};
+
+DebouncedSwitch swStart, swLimitUp, swLimitDown;
+
+// ============================ GAME STATE ===================================
+
+enum GameState { ST_IDLE, ST_HOMING, ST_RUNNING, ST_END };
+GameState state = ST_IDLE;
+
+DoorPhase doorPhase = DOOR_DONE;
+
+uint32_t gameStart     = 0;
+uint32_t homeStart     = 0;
+bool     homeThenStart = false;   // start a game after the door closes
+uint32_t doorPhaseAt   = 0;
+bool     motorStarted  = false;
+bool     doorFault     = false;
+uint32_t errorUntil    = 0;
+uint8_t  errorCode     = 0;
+uint16_t finalScore    = 0;
+uint32_t blinkAt       = 0;
+uint8_t  blinkStep     = 0;
+
+bool doorClosed() { return swLimitUp.active(); }
+bool doorOpen()   { return swLimitDown.active(); }
+
+void setDoorPhase(DoorPhase p, uint32_t now) {
+  doorPhase   = p;
+  doorPhaseAt = now;
+  ledDoorOpen = (p != DOOR_DONE);
+}
+
+void startGame(uint32_t now) {
+  Serial.println(F("[GAME] START"));
+  armSensors();
+  setRelay(PIN_DOOR_RELAY, true);
+  Serial.println(F("[DOOR] opening (door motor ON)"));
+  gameStart    = now;
+  motorStarted = false;
+  doorFault    = false;
+  setDoorPhase(DOOR_OPENING, now);
+  showNumber(0);
+  ledSetMode(LED_GAME, now);
+  state = ST_RUNNING;
+}
+
+// START pressed: close the door first if needed, then start the game
+void requestStart(uint32_t now) {
+  // Every START press clears all scores
+  portENTER_CRITICAL(&scoreMux);
+  score = 0;
+  sensorEventMask = 0;
+  for (uint8_t i = 0; i < 6; i++) sensorHits[i] = 0;
+  portEXIT_CRITICAL(&scoreMux);
+  finalScore = 0;
+  showNumber(0);
+  Serial.println(F("[GAME] START pressed - scores reset to 0"));
+
+  if (doorClosed()) { startGame(now); return; }
+  beginHoming(now, true);
+}
+
+// Run the door motor until LIMIT UP (door closed).
+// startAfter = true: start the game once closed (START press)
+// startAfter = false: just close and go to IDLE (boot)
+void beginHoming(uint32_t now, bool startAfter) {
+  Serial.println(F("[DOOR] not closed - closing (door motor ON)"));
+  setRelay(PIN_DOOR_RELAY, true);
+  homeStart = now;
+  homeThenStart = startAfter;
+  ledSetMode(LED_HOMING, now);
+  state = ST_HOMING;
+}
+
+void runHoming(uint32_t now) {
+  if (doorClosed()) {
+    setRelay(PIN_DOOR_RELAY, false);
+    if (homeThenStart) {
+      Serial.println(F("[DOOR] CLOSED (LIMIT UP) - starting game"));
+      startGame(now);
+    } else {
+      Serial.println(F("[DOOR] CLOSED (LIMIT UP) - ready, press START"));
+      ledSetMode(LED_IDLE, now);
+      swStart.pressed();
+      state = ST_IDLE;
+    }
+    return;
+  }
+  if (now - homeStart >= DOOR_HOME_TIMEOUT_MS) {
+    setRelay(PIN_DOOR_RELAY, false);
+    Serial.println(F("[DOOR] ERROR: could not close door (E01)"));
+    errorCode  = 1;
+    errorUntil = now + ERROR_SHOW_MS;
+    swStart.pressed();
+    state = ST_IDLE;
+  }
+}
+
+void runDoor(uint32_t now) {
+  uint32_t dt = now - doorPhaseAt;
+
+  switch (doorPhase) {
+    case DOOR_OPENING:
+      if (doorOpen()) {
+        setRelay(PIN_DOOR_RELAY, false);
+        Serial.println(F("[DOOR] OPEN (LIMIT DOWN) - door motor OFF"));
+        setDoorPhase(DOOR_HOLD, now);
+      } else if (dt >= DOOR_MOVE_TIMEOUT_MS) {
+        setRelay(PIN_DOOR_RELAY, false);
+        Serial.println(F("[DOOR] WARNING: LIMIT DOWN not reached while opening"));
+        setDoorPhase(DOOR_HOLD, now);
+      }
+      break;
+
+    case DOOR_HOLD:
+      if (dt >= DOOR_OPEN_MS) {
+        setRelay(PIN_DOOR_RELAY, true);
+        Serial.println(F("[DOOR] closing (door motor ON)"));
+        setDoorPhase(DOOR_CLOSING, now);
+      }
+      break;
+
+    case DOOR_CLOSING:
+      // Wait until the door has left the open position before trusting LIMIT UP
+      if (doorClosed() && !doorOpen()) {
+        setRelay(PIN_DOOR_RELAY, false);
+        Serial.println(F("[DOOR] CLOSED (LIMIT UP) - door motor OFF"));
+        setDoorPhase(DOOR_DONE, now);
+      } else if (dt >= DOOR_MOVE_TIMEOUT_MS) {
+        setRelay(PIN_DOOR_RELAY, false);
+        doorFault = true;
+        Serial.println(F("[DOOR] ERROR: LIMIT UP not reached while closing (E02)"));
+        setDoorPhase(DOOR_DONE, now);
+      }
+      break;
+
+    case DOOR_DONE:
+      break;
+  }
+}
+
+void endGame(uint32_t now) {
+  disarmSensors();
+  setRelay(PIN_MOTOR_RELAY, false);
+  setRelay(PIN_DOOR_RELAY, false);
+  if (doorPhase != DOOR_DONE) {
+    doorFault = true;
+    Serial.println(F("[DOOR] ERROR: door cycle not finished at game end (E02)"));
+    setDoorPhase(DOOR_DONE, now);
+  }
+  finalScore = readScore();
+
+  Serial.printf("[GAME] END  score = %u\n", finalScore);
+  Serial.print(F("[GAME] hits per sensor:"));
+  for (uint8_t i = 0; i < 6; i++) Serial.printf(" S%u=%lu", i + 1, (unsigned long)sensorHits[i]);
+  Serial.println();
+  if (doorFault) Serial.println(F("[DOOR] FAULT: door did not close during game"));
+
+  blinkAt   = now;
+  blinkStep = 0;
+  ledSetMode(LED_END, now);
+  state = ST_END;
+}
+
+void runGame(uint32_t now) {
+  uint32_t t = now - gameStart;
+
+  // Motor 500 ms after door opens
+  if (!motorStarted && t >= MOTOR_DELAY_MS) {
+    setRelay(PIN_MOTOR_RELAY, true);
+    motorStarted = true;
+    Serial.println(F("[MOTOR] ON"));
+  }
+
+  runDoor(now);
+
+  uint8_t events = takeSensorEvents();
+  for (uint8_t i = 0; i < 6; i++) {
+    if (!(events & (1 << i))) continue;
+    ledSensorHit(i, now);
+    Serial.printf("[BALL] sensor %u  score = %u\n", i + 1, readScore());
+  }
+
+  showNumber(readScore());
+
+  if (t >= GAME_TIME_MS) endGame(now);
+}
+
+void runEnd(uint32_t now) {
+  if (now - blinkAt < BLINK_INTERVAL_MS) return;
+  blinkAt = now;
+
+  if (blinkStep < BLINK_COUNT * 2) {
+    if (blinkStep % 2 == 0) showBlank(); else showNumber(finalScore);
+    blinkStep++;
+    return;
+  }
+
+  showNumber(finalScore);
+  swStart.pressed();   // drop START presses made during the game
+  Serial.println(F("[GAME] IDLE - press START"));
+  state = ST_IDLE;
+}
+
+void runIdle(uint32_t now) {
+  // Clear door fault once the door is seen closed
+  if (doorFault && doorClosed()) {
+    doorFault = false;
+    Serial.println(F("[DOOR] closed - fault cleared"));
+  }
+
+  // START also clears a door fault: it will try to close the door first
+  if (swStart.pressed()) {
+    errorCode = 0;
+    requestStart(now);
+    return;
+  }
+
+  if (doorFault) {
+    showError(2);
+    ledSetMode(LED_ERROR, now);
+  } else if (errorCode && (int32_t)(errorUntil - now) > 0) {
+    showError(errorCode);
+    ledSetMode(LED_ERROR, now);
+  } else {
+    errorCode = 0;
+    showNumber(finalScore);
+    if (ledMode == LED_ERROR) ledSetMode(LED_IDLE, now);   // let END celebration finish
+  }
+}
+
+// ============================ SETUP / LOOP =================================
+
+void setup() {
+  // Relays OFF before enabling outputs (no click at boot)
+  digitalWrite(PIN_DOOR_RELAY, !RELAY_ON_LEVEL);
+  digitalWrite(PIN_MOTOR_RELAY, !RELAY_ON_LEVEL);
+  pinMode(PIN_DOOR_RELAY, OUTPUT);
+  pinMode(PIN_MOTOR_RELAY, OUTPUT);
+
+  Serial.begin(115200);
+
+  pinMode(PIN_595_DATA, OUTPUT);
+  pinMode(PIN_595_CLOCK, OUTPUT);
+  pinMode(PIN_595_LATCH, OUTPUT);
+  showNumber(0);
+
+  strip.begin();
+  strip.setBrightness(LED_BRIGHTNESS_IDLE);
+  strip.clear();
+  strip.show();
+
+  // GPIO 34-39 are input-only with no internal pull-ups (use external 10k)
+  for (uint8_t i = 0; i < 6; i++) {
+    uint8_t p = SENSOR_PINS[i];
+    if (p >= 34) pinMode(p, INPUT);
+    else pinMode(p, SENSOR_ACTIVE_LEVEL == LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
+  }
+  pinMode(PIN_SW_START, INPUT);
+  pinMode(PIN_SW_LIMIT_UP, INPUT);
+  pinMode(PIN_SW_LIMIT_DN, INPUT);
+
+  swStart.begin(PIN_SW_START);
+  swLimitUp.begin(PIN_SW_LIMIT_UP);
+  swLimitDown.begin(PIN_SW_LIMIT_DN);
+  swStart.pressed();   // ignore a START held during boot
+
+  Serial.println(F("\nCLOUN_V1 booted"));
+
+  // Close the door at power-on if it was left open
+  if (!doorClosed()) beginHoming(millis(), false);
+  else Serial.println(F("[DOOR] closed - ready, press START"));
+}
+
+void loop() {
+  uint32_t now = millis();
+  swStart.update(now);
+  swLimitUp.update(now);
+  swLimitDown.update(now);
+
+  switch (state) {
+    case ST_IDLE:    runIdle(now); break;
+    case ST_HOMING:  runHoming(now); break;
+    case ST_RUNNING: runGame(now); break;
+    case ST_END:     runEnd(now);  break;
+  }
+
+  ledUpdate(now);
+}
